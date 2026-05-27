@@ -1,0 +1,785 @@
+name: Build GDExtension
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-gdextension-${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  ORT_VERSION: "1.24.3"
+  ORT_ANDROID_SHA256: "67397e4a970e75617f765d2015ceaf911917e1d822276cfb5792744e8085cbce"
+  ORT_IOS_SHA256: "b7eedc45932bac758ffd057cac0feb3f682269e47750b159e4c865145cbf0a8e"
+  GODOT_VERSION: "4.4.1-stable"
+  GODOT_TEMPLATES_VERSION: "4.4.1.stable"
+  GODOT_LINUX_ZIP: "Godot_v4.4.1-stable_linux.x86_64.zip"
+  GODOT_MACOS_ZIP: "Godot_v4.4.1-stable_macos.universal.zip"
+  GODOT_EXPORT_TEMPLATES_ARCHIVE: "Godot_v4.4.1-stable_export_templates.tpz"
+  EMSDK_VERSION: "3.1.62"
+  NODE_VERSION: "20"
+  WEB_ORT_CACHE_VERSION: "2"
+  WEB_GODOT_TEMPLATES_CACHE_VERSION: "2"
+  WEB_ORT_BUILD_SIGNATURE: "wasm-static-lib-simd-dual-threads-v1"
+
+jobs:
+  build-desktop:
+    name: Build Desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Windows x86_64", os: windows-latest, platform: windows, arch: x86_64, extra_cmake_args: "", parallel_level: 2 }
+          - { name: "Linux x86_64", os: ubuntu-22.04, platform: linux, arch: x86_64, extra_cmake_args: "", parallel_level: 2 }
+          - { name: "macOS arm64", os: macos-latest, platform: macos, arch: arm64, extra_cmake_args: "-DCMAKE_OSX_ARCHITECTURES=arm64", parallel_level: 2 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: recursive
+
+      - name: Cache ExternalProject dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            build-release/h
+            build-release/he
+            build-release/o
+            build-release/oj
+            build-debug/h
+            build-debug/he
+            build-debug/o
+            build-debug/oj
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-deps-${{ hashFiles('cmake/HTSEngine.cmake', 'cmake/OpenJTalk.cmake', 'cmake/HTSEngine_CMakeLists.txt', 'cmake/OpenJTalk_CMakeLists.txt', 'cmake/patch_openjtalk.cmake') }}
+
+      - name: Cache ONNX Runtime
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            build-release/onnxruntime
+            build-debug/onnxruntime
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-onnxruntime-${{ env.ORT_VERSION }}
+
+      - name: Configure desktop release build
+        shell: bash
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DGODOTCPP_TARGET=template_release ${{ matrix.extra_cmake_args }}
+
+      - name: Build desktop release addon
+        shell: bash
+        run: cmake --build build-release --config Release --parallel ${{ matrix.parallel_level }} --target piper_plus
+
+      - name: Build desktop release test target
+        shell: bash
+        run: cmake --build build-release --config Release --parallel ${{ matrix.parallel_level }} --target piper_plus_tests
+
+      - name: Configure desktop debug build
+        shell: bash
+        run: cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=OFF -DGODOTCPP_TARGET=template_debug ${{ matrix.extra_cmake_args }}
+
+      - name: Build desktop debug addon
+        shell: bash
+        run: cmake --build build-debug --config Debug --parallel ${{ matrix.parallel_level }} --target piper_plus
+
+      - name: Copy ONNX Runtime (Windows)
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          cp build-release/onnxruntime/onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.dll addons/piper_plus/bin/onnxruntime.dll
+          cp build-release/onnxruntime/onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.dll addons/piper_plus/bin/onnxruntime.windows.x86_64.dll
+          if [[ -f build-release/onnxruntime/onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime_providers_shared.dll ]]; then
+            cp build-release/onnxruntime/onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime_providers_shared.dll addons/piper_plus/bin/onnxruntime_providers_shared.dll
+          fi
+
+      - name: Copy ONNX Runtime (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: cp build-release/onnxruntime/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so addons/piper_plus/bin/libonnxruntime.linux.x86_64.so
+
+      - name: Copy ONNX Runtime (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: cp build-release/onnxruntime/onnxruntime-osx-arm64-${ORT_VERSION}/lib/libonnxruntime.dylib addons/piper_plus/bin/libonnxruntime.macos.arm64.dylib
+
+      - name: Collect C++ test binary
+        shell: bash
+        run: |
+          mkdir -p ci/test-bin
+          test_bin="$(find build-release -type f \( -name 'piper_plus_tests' -o -name 'piper_plus_tests.exe' \) | head -n 1)"
+          if [[ -z "$test_bin" ]]; then
+            echo "piper_plus_tests binary not found" >&2
+            exit 1
+          fi
+          cp "$test_bin" ci/test-bin/
+
+      - name: Upload addon bin artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: piper-plus-bin-${{ matrix.platform }}-${{ matrix.arch }}
+          path: addons/piper_plus/bin/
+          if-no-files-found: ignore
+
+      - name: Upload C++ test binary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: piper-plus-tests-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ci/test-bin/
+          if-no-files-found: ignore
+
+  test-desktop:
+    name: Test Desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    needs: build-desktop
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Windows x86_64", os: windows-latest, platform: windows, arch: x86_64 }
+          - { name: "Linux x86_64", os: ubuntu-22.04, platform: linux, arch: x86_64 }
+          - { name: "macOS arm64", os: macos-latest, platform: macos, arch: arm64 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download C++ test binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-tests-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ci/test-bin
+
+      - name: Run C++ tests
+        shell: bash
+        run: |
+          test_bin="$(find ci/test-bin -type f \( -name 'piper_plus_tests' -o -name 'piper_plus_tests.exe' \) | head -n 1)"
+          if [[ -z "$test_bin" ]]; then
+            echo "downloaded test binary not found" >&2
+            exit 1
+          fi
+          chmod +x "$test_bin" 2>/dev/null || true
+          "$test_bin" --gtest_color=yes
+
+  integration-linux:
+    name: Linux Godot Headless Integration
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs:
+      - build-desktop
+      - test-desktop
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: recursive
+
+      - name: Download Linux addon bin artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-bin-linux-x86_64
+          path: addons/piper_plus/bin
+
+      - name: Download Godot Linux binary
+        shell: bash
+        run: |
+          curl -L -o "${GODOT_LINUX_ZIP}" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/${GODOT_LINUX_ZIP}"
+          curl -L -o SHA512-SUMS.txt "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/SHA512-SUMS.txt"
+          grep " ${GODOT_LINUX_ZIP}\$" SHA512-SUMS.txt > godot.sha512
+          sha512sum -c godot.sha512
+          unzip -q "${GODOT_LINUX_ZIP}" -d /tmp/godot
+          chmod +x "/tmp/godot/${GODOT_LINUX_ZIP%.zip}"
+
+      - name: Run Linux Godot headless tests
+        shell: bash
+        run: GODOT="/tmp/godot/${GODOT_LINUX_ZIP%.zip}" bash test/run-tests.sh
+
+  build-mobile:
+    name: Build Mobile (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Android arm64", os: ubuntu-22.04, platform: android, arch: arm64, parallel_level: 2 }
+          - { name: "iOS arm64", os: macos-latest, platform: ios, arch: arm64, parallel_level: 2 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: recursive
+
+      - name: Cache ExternalProject dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: |
+            build-release/h
+            build-release/he
+            build-release/o
+            build-release/oj
+            build-debug/h
+            build-debug/he
+            build-debug/o
+            build-debug/oj
+          key: ${{ matrix.platform }}-${{ matrix.arch }}-deps-${{ hashFiles('cmake/HTSEngine.cmake', 'cmake/OpenJTalk.cmake', 'cmake/HTSEngine_CMakeLists.txt', 'cmake/OpenJTalk_CMakeLists.txt', 'cmake/patch_openjtalk.cmake') }}
+
+      - name: Cache Android ONNX Runtime
+        id: cache-android-ort
+        if: matrix.platform == 'android'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ort-android
+          key: android-arm64-onnxruntime-${{ env.ORT_VERSION }}-${{ env.ORT_ANDROID_SHA256 }}
+
+      - name: Cache iOS ONNX Runtime
+        id: cache-ios-ort
+        if: matrix.platform == 'ios'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ort-ios
+          key: ios-arm64-onnxruntime-${{ env.ORT_VERSION }}-${{ env.ORT_IOS_SHA256 }}
+
+      - name: Download ONNX Runtime for Android
+        if: matrix.platform == 'android' && steps.cache-android-ort.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -L -o ort.aar "https://repo1.maven.org/maven2/com/microsoft/onnxruntime/onnxruntime-android/${ORT_VERSION}/onnxruntime-android-${ORT_VERSION}.aar"
+          echo "${ORT_ANDROID_SHA256}  ort.aar" | sha256sum -c -
+          unzip -o ort.aar jni/arm64-v8a/libonnxruntime.so -d ort-extract
+          unzip -o ort.aar 'headers/*' -d ort-extract
+          mkdir -p ort-android/lib ort-android/include
+          cp ort-extract/jni/arm64-v8a/libonnxruntime.so ort-android/lib/
+          cp ort-extract/headers/* ort-android/include/
+
+      - name: Download ONNX Runtime for iOS
+        if: matrix.platform == 'ios' && steps.cache-ios-ort.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -L -o ort-ios.zip "https://onnxruntimepackages.z14.web.core.windows.net/pod-archive-onnxruntime-c-${ORT_VERSION}.zip"
+          echo "${ORT_IOS_SHA256}  ort-ios.zip" | shasum -a 256 -c -
+          unzip -q ort-ios.zip "onnxruntime.xcframework/ios-arm64/onnxruntime.framework/onnxruntime" "Headers/*" -d ort-ios-extract
+          mkdir -p ort-ios/lib ort-ios/include
+          cp ort-ios-extract/onnxruntime.xcframework/ios-arm64/onnxruntime.framework/onnxruntime ort-ios/lib/libonnxruntime.a
+          cp -r ort-ios-extract/Headers/* ort-ios/include/
+
+      - name: Configure Android release build
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DGODOTCPP_TARGET=template_release \
+            -DONNXRUNTIME_DIR="$PWD/ort-android"
+
+      - name: Build Android release
+        if: matrix.platform == 'android'
+        shell: bash
+        run: cmake --build build-release --parallel ${{ matrix.parallel_level }} --target piper_plus
+
+      - name: Configure Android debug build
+        if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DGODOTCPP_TARGET=template_debug \
+            -DONNXRUNTIME_DIR="$PWD/ort-android"
+
+      - name: Build Android debug
+        if: matrix.platform == 'android'
+        shell: bash
+        run: cmake --build build-debug --parallel ${{ matrix.parallel_level }} --target piper_plus
+
+      - name: Configure iOS release build
+        if: matrix.platform == 'ios'
+        shell: bash
+        run: |
+          cmake -B build-release -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/thirdparty/godot-cpp/cmake/ios.toolchain.cmake" \
+            -DPLATFORM=OS64 \
+            -DDEPLOYMENT_TARGET=15.0 \
+            -DGODOTCPP_TARGET=template_release \
+            -DONNXRUNTIME_DIR="$PWD/ort-ios"
+
+      - name: Build iOS release
+        if: matrix.platform == 'ios'
+        shell: bash
+        run: cmake --build build-release --config Release --parallel ${{ matrix.parallel_level }} --target piper_plus
+
+      - name: Configure iOS debug build
+        if: matrix.platform == 'ios'
+        shell: bash
+        run: |
+          cmake -B build-debug -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/thirdparty/godot-cpp/cmake/ios.toolchain.cmake" \
+            -DPLATFORM=OS64 \
+            -DDEPLOYMENT_TARGET=15.0 \
+            -DGODOTCPP_TARGET=template_debug \
+            -DONNXRUNTIME_DIR="$PWD/ort-ios"
+
+      - name: Build iOS debug
+        if: matrix.platform == 'ios'
+        shell: bash
+        run: cmake --build build-debug --config Debug --parallel ${{ matrix.parallel_level }} --target piper_plus
+
+      - name: Copy ONNX Runtime (Android)
+        if: matrix.platform == 'android'
+        shell: bash
+        run: cp ort-android/lib/libonnxruntime.so addons/piper_plus/bin/libonnxruntime.android.arm64.so
+
+      - name: Upload addon bin artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: piper-plus-bin-${{ matrix.platform }}-${{ matrix.arch }}
+          path: addons/piper_plus/bin/
+          if-no-files-found: ignore
+
+  build-web:
+    name: Build Web
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build scons
+
+      - name: Set up emsdk
+        uses: emscripten-core/setup-emsdk@4528d102f7230f0e7b276855c01ea1159be0e984
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore ONNX Runtime Web no-thread cache
+        id: cache-ort-web-nothreads
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/onnxruntime-web-nothreads
+          key: web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_ORT_CACHE_VERSION }}-${{ env.WEB_ORT_BUILD_SIGNATURE }}-nothreads-${{ hashFiles('scripts/ci/build-onnxruntime-web.sh') }}
+          restore-keys: |
+            web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_ORT_CACHE_VERSION }}-nothreads-
+
+      - name: Restore legacy ONNX Runtime Web no-thread cache
+        if: steps.cache-ort-web-nothreads.outputs.cache-hit != 'true'
+        id: cache-ort-web-nothreads-legacy
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/onnxruntime-web-nothreads
+          key: web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-nothreads-${{ hashFiles('scripts/ci/build-onnxruntime-web.sh') }}
+          restore-keys: |
+            web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-nothreads-
+
+      - name: Restore ONNX Runtime Web threads cache
+        id: cache-ort-web-threads
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/onnxruntime-web-threads
+          key: web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_ORT_CACHE_VERSION }}-${{ env.WEB_ORT_BUILD_SIGNATURE }}-threads-${{ hashFiles('scripts/ci/build-onnxruntime-web.sh') }}
+          restore-keys: |
+            web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_ORT_CACHE_VERSION }}-threads-
+
+      - name: Restore legacy ONNX Runtime Web threads cache
+        if: steps.cache-ort-web-threads.outputs.cache-hit != 'true'
+        id: cache-ort-web-threads-legacy
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/onnxruntime-web-threads
+          key: web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-threads-${{ hashFiles('scripts/ci/build-onnxruntime-web.sh') }}
+          restore-keys: |
+            web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-threads-
+
+      - name: Check restored ONNX Runtime Web packages
+        id: ort-web-packages
+        shell: bash
+        run: |
+          ort_package_ready() {
+            local package_root="$1"
+            local header_root="$package_root/include/onnxruntime_cxx_api.h"
+            local header_nested="$package_root/include/onnxruntime/core/session/onnxruntime_cxx_api.h"
+
+            [[ -f "$package_root/lib/libonnxruntime_webassembly.a" ]] && \
+            ([[ -f "$header_root" ]] || [[ -f "$header_nested" ]])
+          }
+
+          nothreads_ready=false
+          if ort_package_ready "$RUNNER_TEMP/onnxruntime-web-nothreads"; then
+            nothreads_ready=true
+          fi
+
+          threads_ready=false
+          if ort_package_ready "$RUNNER_TEMP/onnxruntime-web-threads"; then
+            threads_ready=true
+          fi
+
+          echo "nothreads_ready=$nothreads_ready" >> "$GITHUB_OUTPUT"
+          echo "threads_ready=$threads_ready" >> "$GITHUB_OUTPUT"
+          echo "nothreads_ready=$nothreads_ready"
+          echo "threads_ready=$threads_ready"
+
+      - name: Build ONNX Runtime Web static library packages
+        if: steps.ort-web-packages.outputs.nothreads_ready != 'true' || steps.ort-web-packages.outputs.threads_ready != 'true'
+        shell: bash
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/onnxruntime" ]]; then
+            git clone --recursive --shallow-submodules --depth 1 --branch "v${ORT_VERSION}" https://github.com/microsoft/onnxruntime.git "$RUNNER_TEMP/onnxruntime"
+          fi
+          chmod +x scripts/ci/build-onnxruntime-web.sh
+          if [[ ! -f "$RUNNER_TEMP/onnxruntime-web-nothreads/lib/libonnxruntime_webassembly.a" ]]; then
+            ORT_EMSDK_VERSION="${EMSDK_VERSION}" \
+            ORT_BUILD_FLAGS="--build_wasm_static_lib --enable_wasm_simd --skip_tests --disable_rtti --config Release --build_dir build-wasm-static-nothreads --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF --skip_submodule_sync" \
+            bash scripts/ci/build-onnxruntime-web.sh "$RUNNER_TEMP/onnxruntime" "$RUNNER_TEMP/onnxruntime-web-nothreads"
+          fi
+          if [[ ! -f "$RUNNER_TEMP/onnxruntime-web-threads/lib/libonnxruntime_webassembly.a" ]]; then
+            ORT_EMSDK_VERSION="${EMSDK_VERSION}" \
+            ORT_BUILD_FLAGS="--build_wasm_static_lib --enable_wasm_simd --enable_wasm_threads --skip_tests --disable_rtti --config Release --build_dir build-wasm-static-threads --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF --skip_submodule_sync" \
+            bash scripts/ci/build-onnxruntime-web.sh "$RUNNER_TEMP/onnxruntime" "$RUNNER_TEMP/onnxruntime-web-threads"
+          fi
+
+      - name: Save ONNX Runtime Web no-thread cache
+        if: steps.cache-ort-web-nothreads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/onnxruntime-web-nothreads
+          key: web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_ORT_CACHE_VERSION }}-${{ env.WEB_ORT_BUILD_SIGNATURE }}-nothreads-${{ hashFiles('scripts/ci/build-onnxruntime-web.sh') }}
+
+      - name: Save ONNX Runtime Web threads cache
+        if: steps.cache-ort-web-threads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/onnxruntime-web-threads
+          key: web-onnxruntime-${{ runner.os }}-${{ env.ORT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_ORT_CACHE_VERSION }}-${{ env.WEB_ORT_BUILD_SIGNATURE }}-threads-${{ hashFiles('scripts/ci/build-onnxruntime-web.sh') }}
+
+      - name: Restore custom Godot Web export templates cache
+        id: cache-godot-web-templates
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/godot-web-templates
+          key: web-godot-templates-${{ runner.os }}-${{ env.GODOT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_GODOT_TEMPLATES_CACHE_VERSION }}-${{ hashFiles('scripts/ci/build-godot-web-templates.sh', 'scripts/ci/install-godot-export-templates.sh', 'scripts/ci/patch-web-asm-const.mjs') }}
+          restore-keys: |
+            web-godot-templates-${{ runner.os }}-${{ env.GODOT_VERSION }}-${{ env.EMSDK_VERSION }}-
+
+      - name: Check restored custom Godot Web export templates
+        id: godot-web-templates
+        shell: bash
+        run: |
+          templates_ready=false
+          if [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_debug.zip" ]] && \
+             [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_release.zip" ]] && \
+             [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_nothreads_debug.zip" ]] && \
+             [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_nothreads_release.zip" ]]; then
+            templates_ready=true
+          fi
+
+          echo "ready=$templates_ready" >> "$GITHUB_OUTPUT"
+          echo "templates_ready=$templates_ready"
+
+      - name: Build custom Godot Web export templates
+        if: steps.godot-web-templates.outputs.ready != 'true'
+        shell: bash
+        run: |
+          if [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_debug.zip" ]] && \
+             [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_release.zip" ]] && \
+             [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_nothreads_debug.zip" ]] && \
+             [[ -f "$RUNNER_TEMP/godot-web-templates/web_dlink_nothreads_release.zip" ]]; then
+            echo "Using restored custom Godot Web export templates from cache."
+            exit 0
+          fi
+          git clone --depth 1 --branch "$GODOT_VERSION" https://github.com/godotengine/godot.git "$RUNNER_TEMP/godot-source"
+          chmod +x scripts/ci/build-godot-web-templates.sh
+          GODOT_SOURCE_DIR="$RUNNER_TEMP/godot-source" bash scripts/ci/build-godot-web-templates.sh "$RUNNER_TEMP/godot-web-templates"
+
+      - name: Save custom Godot Web export templates cache
+        if: steps.cache-godot-web-templates.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ${{ runner.temp }}/godot-web-templates
+          key: web-godot-templates-${{ runner.os }}-${{ env.GODOT_VERSION }}-${{ env.EMSDK_VERSION }}-${{ env.WEB_GODOT_TEMPLATES_CACHE_VERSION }}-${{ hashFiles('scripts/ci/build-godot-web-templates.sh', 'scripts/ci/install-godot-export-templates.sh', 'scripts/ci/patch-web-asm-const.mjs') }}
+
+      - name: Install custom Godot Web export templates
+        shell: bash
+        run: |
+          chmod +x scripts/ci/install-godot-export-templates.sh
+          GODOT_SKIP_OFFICIAL_TEMPLATES=1 \
+          GODOT_WEB_TEMPLATES_DIR="$RUNNER_TEMP/godot-web-templates" \
+          bash scripts/ci/install-godot-export-templates.sh
+
+      - name: Build Web addon binaries
+        shell: bash
+        run: |
+          chmod +x scripts/ci/build-web-side-module.sh
+          ONNXRUNTIME_DIR_NOTHREADS="$RUNNER_TEMP/onnxruntime-web-nothreads" \
+          ONNXRUNTIME_DIR_THREADS="$RUNNER_TEMP/onnxruntime-web-threads" \
+          bash scripts/ci/build-web-side-module.sh "$RUNNER_TEMP/web-artifacts"
+
+      - name: Download Linux addon bin artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-bin-linux-x86_64
+          path: addons/piper_plus/bin
+
+      - name: Download Godot Linux binary
+        shell: bash
+        run: |
+          curl -L -o "${GODOT_LINUX_ZIP}" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/${GODOT_LINUX_ZIP}"
+          curl -L -o SHA512-SUMS.txt "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/SHA512-SUMS.txt"
+          grep " ${GODOT_LINUX_ZIP}\$" SHA512-SUMS.txt > godot.sha512
+          sha512sum -c godot.sha512
+          unzip -q "${GODOT_LINUX_ZIP}" -d "$RUNNER_TEMP/godot"
+          chmod +x "$RUNNER_TEMP/godot/${GODOT_LINUX_ZIP%.zip}"
+          echo "GODOT=$RUNNER_TEMP/godot/${GODOT_LINUX_ZIP%.zip}" >> "$GITHUB_ENV"
+
+      - name: Install Playwright
+        shell: bash
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run Web smoke
+        shell: bash
+        run: |
+          chmod +x scripts/ci/export-web-smoke.sh
+          export PIPER_WEB_SMOKE_SCENARIOS="$(node scripts/ci/generate-pages-manifest.mjs --catalog tests/fixtures/multilingual_sample_text_catalog.json --list-language-codes)"
+          bash scripts/ci/export-web-smoke.sh "$RUNNER_TEMP/web-smoke"
+
+      - name: Upload Web smoke export artifact
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: piper-plus-web-smoke-export
+          path: ${{ runner.temp }}/web-smoke/
+          if-no-files-found: ignore
+
+      - name: Upload Web addon bin artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: piper-plus-bin-web-wasm32
+          path: addons/piper_plus/bin/
+          if-no-files-found: ignore
+
+  package-addon:
+    name: Package Complete Addon
+    runs-on: ubuntu-22.04
+    needs:
+      - build-mobile
+      - build-web
+      - test-desktop
+      - integration-linux
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download bin artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: piper-plus-bin-*
+          path: artifacts
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          chmod +x scripts/ci/package-addon.sh scripts/ci/validate-addon-package.sh scripts/ci/smoke-test-packaged-addon.sh
+          scripts/ci/package-addon.sh artifacts package "$PWD/addons/piper_plus"
+          scripts/ci/validate-addon-package.sh package/addons/piper_plus
+          cd package
+          zip -r ../piper-plus-addon-package.zip addons/
+
+      - name: Upload packaged addon
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: piper-plus-addon-package
+          path: piper-plus-addon-package.zip
+
+  packaged-addon-windows:
+    name: Windows Packaged Addon Smoke Test
+    runs-on: windows-latest
+    needs: package-addon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download packaged addon
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-addon-package
+          path: dist
+
+      - name: Extract packaged addon
+        shell: bash
+        run: unzip -q dist/piper-plus-addon-package.zip -d package
+
+      - name: Install Godot on Windows runner
+        shell: powershell
+        run: |
+          winget install --id GodotEngine.GodotEngine -e --accept-package-agreements --accept-source-agreements
+          "GODOT=$env:LOCALAPPDATA\\Microsoft\\WinGet\\Links\\godot_console.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run packaged addon smoke test
+        shell: bash
+        run: |
+          chmod +x scripts/ci/smoke-test-packaged-addon.sh
+          bash scripts/ci/smoke-test-packaged-addon.sh package/addons/piper_plus
+
+  packaged-addon-macos:
+    name: macOS Packaged Addon Smoke Test
+    runs-on: macos-latest
+    needs: package-addon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download packaged addon
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-addon-package
+          path: dist
+
+      - name: Extract packaged addon
+        shell: bash
+        run: unzip -q dist/piper-plus-addon-package.zip -d package
+
+      - name: Download Godot macOS binary
+        shell: bash
+        run: |
+          curl -L -o "${GODOT_MACOS_ZIP}" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/${GODOT_MACOS_ZIP}"
+          curl -L -o SHA512-SUMS.txt "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/SHA512-SUMS.txt"
+          grep " ${GODOT_MACOS_ZIP}\$" SHA512-SUMS.txt > godot.sha512
+          shasum -a 512 -c godot.sha512
+          unzip -q "${GODOT_MACOS_ZIP}" -d "$RUNNER_TEMP/godot"
+          chmod +x "$RUNNER_TEMP/godot/Godot.app/Contents/MacOS/Godot"
+
+      - name: Run packaged addon smoke test
+        shell: bash
+        env:
+          GODOT: ${{ runner.temp }}/godot/Godot.app/Contents/MacOS/Godot
+        run: |
+          chmod +x scripts/ci/smoke-test-packaged-addon.sh
+          bash scripts/ci/smoke-test-packaged-addon.sh package/addons/piper_plus
+
+  export-android:
+    name: Android Export Smoke
+    runs-on: ubuntu-22.04
+    needs: package-addon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download packaged addon
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-addon-package
+          path: dist
+
+      - name: Extract packaged addon
+        shell: bash
+        run: unzip -q dist/piper-plus-addon-package.zip -d package
+
+      - name: Download Godot Linux binary
+        shell: bash
+        run: |
+          curl -L -o "${GODOT_LINUX_ZIP}" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/${GODOT_LINUX_ZIP}"
+          curl -L -o SHA512-SUMS.txt "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/SHA512-SUMS.txt"
+          grep " ${GODOT_LINUX_ZIP}\$" SHA512-SUMS.txt > godot.sha512
+          sha512sum -c godot.sha512
+          unzip -q "${GODOT_LINUX_ZIP}" -d /tmp/godot
+          chmod +x "/tmp/godot/${GODOT_LINUX_ZIP%.zip}"
+
+      - name: Install Godot export templates
+        shell: bash
+        run: |
+          chmod +x scripts/ci/install-godot-export-templates.sh
+          bash scripts/ci/install-godot-export-templates.sh
+
+      - name: Prepare Android SDK environment
+        shell: bash
+        run: |
+          if [[ -z "${ANDROID_SDK_ROOT:-}" && -d /usr/local/lib/android/sdk ]]; then
+            echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
+            echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "${JAVA_HOME_17_X64:-}" ]]; then
+            echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run Android export smoke
+        shell: bash
+        run: |
+          chmod +x scripts/ci/export-android-smoke.sh
+          GODOT="/tmp/godot/${GODOT_LINUX_ZIP%.zip}" bash scripts/ci/export-android-smoke.sh package/addons/piper_plus
+
+  export-ios:
+    name: iOS Export Smoke
+    runs-on: macos-latest
+    needs: package-addon
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download packaged addon
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: piper-plus-addon-package
+          path: dist
+
+      - name: Extract packaged addon
+        shell: bash
+        run: unzip -q dist/piper-plus-addon-package.zip -d package
+
+      - name: Download Godot macOS binary
+        shell: bash
+        run: |
+          curl -L -o "${GODOT_MACOS_ZIP}" "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/${GODOT_MACOS_ZIP}"
+          curl -L -o SHA512-SUMS.txt "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}/SHA512-SUMS.txt"
+          grep " ${GODOT_MACOS_ZIP}\$" SHA512-SUMS.txt > godot.sha512
+          shasum -a 512 -c godot.sha512
+          unzip -q "${GODOT_MACOS_ZIP}" -d "$RUNNER_TEMP/godot"
+          chmod +x "$RUNNER_TEMP/godot/Godot.app/Contents/MacOS/Godot"
+
+      - name: Install Godot export templates
+        shell: bash
+        run: |
+          chmod +x scripts/ci/install-godot-export-templates.sh
+          bash scripts/ci/install-godot-export-templates.sh
+
+      - name: Select Xcode
+        shell: bash
+        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Run iOS export smoke
+        shell: bash
+        env:
+          GODOT: ${{ runner.temp }}/godot/Godot.app/Contents/MacOS/Godot
+        run: |
+          chmod +x scripts/ci/export-ios-smoke.sh
+          bash scripts/ci/export-ios-smoke.sh package/addons/piper_plus
